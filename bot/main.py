@@ -1,4 +1,5 @@
-import asyncio, json
+import asyncio, os, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from .config import settings
@@ -14,7 +15,7 @@ from .execution import get_broker
 log = get_logger(__name__)
 
 RISK_TEXT = (
-    "⚠️ *ORACLE-X RISK ACKNOWLEDGEMENT*\n\n"
+    "[WARN] *ORACLE-X RISK ACKNOWLEDGEMENT*\n\n"
     "Trading involves substantial risk of loss. Signals are probabilistic research, not advice. "
     "You are solely responsible for your capital. Default mode is PAPER. "
     "Type /ack to acknowledge and enable signals."
@@ -24,22 +25,18 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     upsert_user(u.id, u.username)
     await update.message.reply_text(
-        f"🔮 ORACLE-X online.\nHello {u.first_name}.\n\n"
-        "Commands:\n"
-        "/ack — acknowledge risk\n"
-        "/scan SYMBOL — run oracle on a ticker (e.g. /scan AAPL, /scan BTC)\n"
-        "/positions — list open paper trades\n"
-        "/mode paper|live — switch mode (admin)\n"
-        "/help")
+        f"ORACLE-X online.\nHello {u.first_name}.\n\n"
+        "Commands:\n/ack - acknowledge risk\n/scan SYMBOL - run oracle (e.g. /scan AAPL, /scan BTC)\n"
+        "/positions - open paper trades\n/mode paper|live - switch (admin)\n/help")
 
-async def help_cmd(update: Update, ctx):
+async def help_cmd(update, ctx):
     await update.message.reply_text(RISK_TEXT, parse_mode="Markdown")
 
-async def ack(update: Update, ctx):
+async def ack(update, ctx):
     set_user_field(update.effective_user.id, "risk_acknowledged", 1)
-    await update.message.reply_text("✅ Risk acknowledged. Signals enabled (paper mode).")
+    await update.message.reply_text("Risk acknowledged. Signals enabled (paper mode).")
 
-async def mode(update: Update, ctx):
+async def mode(update, ctx):
     if str(update.effective_user.id) != str(settings.ADMIN_TELEGRAM_ID):
         await update.message.reply_text("Admins only."); return
     if not ctx.args or ctx.args[0] not in ("paper", "live"):
@@ -47,17 +44,16 @@ async def mode(update: Update, ctx):
     set_user_field(update.effective_user.id, "paper_mode", 1 if ctx.args[0] == "paper" else 0)
     await update.message.reply_text(f"Mode set: {ctx.args[0]}")
 
-def _fmt_signal(sig: dict) -> str:
-    v = sig.get("verification", {})
-    return (f"*{sig['symbol']}* — *{sig['side'].upper()}*\n"
+def _fmt_signal(sig):
+    v = sig.get("verification", {}) or {}
+    return (f"*{sig['symbol']}* - *{sig['side'].upper()}*\n"
             f"Entry: `{sig.get('entry')}`  Stop: `{sig.get('stop')}`  Target: `{sig.get('target')}`\n"
             f"Confidence: *{sig.get('confidence',0):.2f}*  R: {sig.get('r_multiple','?')}\n"
             f"Thesis: {sig.get('thesis','')[:400]}\n"
-            f"Verify: price={v.get('price_confirms')} vol={v.get('volume_confirms')} "
-            f"news_risk={v.get('news_risk')}\n"
+            f"Verify: price={v.get('price_confirms')} vol={v.get('volume_confirms')} news_risk={v.get('news_risk')}\n"
             f"Notes: {sig.get('notes','')[:200]}")
 
-async def scan(update: Update, ctx):
+async def scan(update, ctx):
     u = update.effective_user
     user = get_user(u.id)
     if not user or not user.get("risk_acknowledged"):
@@ -65,20 +61,18 @@ async def scan(update: Update, ctx):
     if not ctx.args:
         await update.message.reply_text("Usage: /scan SYMBOL"); return
     symbol = ctx.args[0].upper()
-    await update.message.reply_text(f"🔍 ORACLE-X scanning {symbol}...")
+    await update.message.reply_text(f"ORACLE-X scanning {symbol}...")
     md = await asyncio.to_thread(get_context, symbol)
     md["headlines"] = await asyncio.to_thread(fetch_headlines, symbol)
     sig = await asyncio.to_thread(analyze, md)
     ok, reason = check_gates(u.id, sig)
     sig_id = save_signal(u.id, {**sig, "thesis": sig.get("thesis", "")[:1000]})
     journal(u.id, "signal", {"symbol": symbol, "ok": ok, "reason": reason, "sig": sig})
-    msg = _fmt_signal(sig) + f"\n\nGate: *{'PASS' if ok else 'BLOCK'}* — {reason}"
-    kb = None
-    if ok:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Execute (paper)", callback_data=f"exec:{sig_id}")]])
+    msg = _fmt_signal(sig) + f"\n\nGate: *{'PASS' if ok else 'BLOCK'}* - {reason}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Execute (paper)", callback_data=f"exec:{sig_id}")]]) if ok else None
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
 
-async def on_callback(update: Update, ctx):
+async def on_callback(update, ctx):
     q = update.callback_query; await q.answer()
     data = q.data or ""
     if data.startswith("exec:"):
@@ -92,18 +86,31 @@ async def on_callback(update: Update, ctx):
         sig = dict(r)
         qty = position_size(float(user.get("equity", 10000)), float(sig["entry"]), float(sig["stop"]))
         if qty <= 0:
-            await q.edit_message_text("Invalid size — aborted."); return
+            await q.edit_message_text("Invalid size - aborted."); return
         broker = get_broker()
         trade_id = broker.place(q.from_user.id, sig_id, sig, qty)
-        await q.edit_message_text(f"✅ Order sent via {broker.name}. qty={qty} trade_id={trade_id}")
+        await q.edit_message_text(f"Order sent via {broker.name}. qty={qty} trade_id={trade_id}")
 
-async def positions(update: Update, ctx):
+async def positions(update, ctx):
     rows = list_open_trades(update.effective_user.id)
     if not rows:
         await update.message.reply_text("No open positions."); return
     lines = [f"#{r['id']} {r['symbol']} {r['side']} qty={r['qty']} @ {r['entry']}  stop={r['stop']} tgt={r['target']}"
              for r in rows]
     await update.message.reply_text("Open positions:\n" + "\n".join(lines))
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+        self.wfile.write(b'{"status":"ok","service":"oracle-x"}')
+    def log_message(self, *a, **k): pass
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    srv = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info("Health server listening on :%s", port)
+    srv.serve_forever()
 
 def build_app():
     init_db()
@@ -120,9 +127,10 @@ def build_app():
     return app
 
 def main():
+    threading.Thread(target=start_health_server, daemon=True).start()
     app = build_app()
-    log.info("🔮 ORACLE-X starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("ORACLE-X starting polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
