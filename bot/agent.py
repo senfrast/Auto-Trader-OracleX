@@ -1,7 +1,8 @@
-"""Claude tool-use agent loop for ORACLE-X.
-Gives the LLM a toolbox and lets it iterate like OpenHands / Agent Zero.
+"""Tool-use agent loop for ORACLE-X.
+Supports OpenAI-compatible providers: Groq (default, free), OpenAI, or Anthropic.
+Provider is chosen via LLM_PROVIDER env var: groq | openai | anthropic.
 """
-import asyncio, json
+import asyncio, json, os
 from .config import settings
 from .logger import get_logger
 from .market_data import get_context
@@ -40,14 +41,23 @@ RULES
 - If user asks a general question (not a symbol), answer plainly without tools.
 """
 
-TOOLS = [
-  {"name":"get_market_data","description":"Fetch live price, 24h change, relative volume, recent high/low for a stock or crypto symbol. Always call this before deciding on a trade.","input_schema":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}},
-  {"name":"get_news","description":"Fetch recent news headlines for a symbol.","input_schema":{"type":"object","properties":{"symbol":{"type":"string"},"limit":{"type":"integer"}},"required":["symbol"]}},
-  {"name":"get_positions","description":"List the current user's open paper/live positions.","input_schema":{"type":"object","properties":{}}},
-  {"name":"compute_position_size","description":"Compute qty from current equity + entry + stop using configured per-trade risk %.","input_schema":{"type":"object","properties":{"entry":{"type":"number"},"stop":{"type":"number"}},"required":["entry","stop"]}},
-  {"name":"place_trade","description":"Submit a paper/live order AFTER calling get_market_data and building a full thesis. System applies risk gates (confidence>=0.65, valid geometry, max positions).","input_schema":{"type":"object","properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["long","short"]},"entry":{"type":"number"},"stop":{"type":"number"},"target":{"type":"number"},"confidence":{"type":"number"},"thesis":{"type":"string"}},"required":["symbol","side","entry","stop","target","confidence","thesis"]}},
-  {"name":"close_position","description":"Close an open position by trade id at the given exit price.","input_schema":{"type":"object","properties":{"trade_id":{"type":"integer"},"exit_price":{"type":"number"}},"required":["trade_id","exit_price"]}}
+_TOOL_DEFS = [
+    ("get_market_data", "Fetch live price, 24h change, relative volume, recent high/low for a stock or crypto symbol. Always call this before deciding on a trade.",
+     {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}),
+    ("get_news", "Fetch recent news headlines for a symbol.",
+     {"type": "object", "properties": {"symbol": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["symbol"]}),
+    ("get_positions", "List the current user's open paper/live positions.",
+     {"type": "object", "properties": {}}),
+    ("compute_position_size", "Compute qty from current equity + entry + stop using configured per-trade risk %.",
+     {"type": "object", "properties": {"entry": {"type": "number"}, "stop": {"type": "number"}}, "required": ["entry", "stop"]}),
+    ("place_trade", "Submit a paper/live order AFTER calling get_market_data and building a full thesis. System applies risk gates (confidence>=0.65, valid geometry, max positions).",
+     {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["long", "short"]}, "entry": {"type": "number"}, "stop": {"type": "number"}, "target": {"type": "number"}, "confidence": {"type": "number"}, "thesis": {"type": "string"}}, "required": ["symbol", "side", "entry", "stop", "target", "confidence", "thesis"]}),
+    ("close_position", "Close an open position by trade id at the given exit price.",
+     {"type": "object", "properties": {"trade_id": {"type": "integer"}, "exit_price": {"type": "number"}}, "required": ["trade_id", "exit_price"]}),
 ]
+
+OPENAI_TOOLS = [{"type": "function", "function": {"name": n, "description": d, "parameters": p}} for n, d, p in _TOOL_DEFS]
+ANTHROPIC_TOOLS = [{"name": n, "description": d, "input_schema": p} for n, d, p in _TOOL_DEFS]
 
 
 def _dispatch(name, args, user_id):
@@ -84,7 +94,8 @@ def _dispatch(name, args, user_id):
             trade_id = int(args["trade_id"]); exit_price = float(args["exit_price"])
             with conn() as c:
                 r = c.execute("SELECT * FROM trades WHERE id=? AND user_id=?", (trade_id, str(user_id))).fetchone()
-            if not r: return {"error": "trade not found"}
+            if not r:
+                return {"error": "trade not found"}
             t = dict(r)
             direction = 1 if t["side"] == "long" else -1
             pnl = round((exit_price - float(t["entry"])) * float(t["qty"]) * direction, 2)
@@ -97,21 +108,74 @@ def _dispatch(name, args, user_id):
         return {"error": str(e)}
 
 
-async def run_agent(user_id, user_message, max_iterations=8):
+def _resolve_provider():
+    prov = (settings.LLM_PROVIDER or "").lower().strip()
+    if prov in ("groq", "openai", "anthropic"):
+        return prov
+    if settings.GROQ_API_KEY:
+        return "groq"
+    if settings.OPENAI_API_KEY:
+        return "openai"
+    if settings.ANTHROPIC_API_KEY:
+        return "anthropic"
+    return "groq"
+
+
+async def _run_openai_compat(user_id, user_message, max_iterations, base_url, api_key, model):
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        return f"Agent unavailable: openai SDK missing ({e})", []
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message}]
+    trace = []
+    for step in range(max_iterations):
+        try:
+            resp = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=model, messages=messages, tools=OPENAI_TOOLS,
+                tool_choice="auto", max_tokens=1600, temperature=0.3,
+            )
+        except Exception as e:
+            log.exception("agent LLM call failed: %s", e)
+            return f"Agent LLM error: {e}", trace
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            final = (msg.content or "").strip()
+            trace.append(f"stop:{resp.choices[0].finish_reason}")
+            return final or "(no text)", trace
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [{"id": tc.id, "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            trace.append(f"{tc.function.name}({json.dumps(args)[:120]})")
+            result = await asyncio.to_thread(_dispatch, tc.function.name, args, user_id)
+            messages.append({"role": "tool", "tool_call_id": tc.id,
+                             "content": json.dumps(result)[:6000]})
+    return "Agent hit max iterations without a final verdict.", trace
+
+
+async def _run_anthropic(user_id, user_message, max_iterations, api_key, model):
     try:
         from anthropic import Anthropic
     except Exception as e:
         return f"Agent unavailable: anthropic SDK missing ({e})", []
-    if not settings.ANTHROPIC_API_KEY:
-        return "Agent unavailable: ANTHROPIC_API_KEY not set.", []
-    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    model = settings.LLM_MODEL or "claude-opus-4-5"
+    client = Anthropic(api_key=api_key)
     messages = [{"role": "user", "content": user_message}]
     trace = []
     for step in range(max_iterations):
         try:
             resp = await asyncio.to_thread(client.messages.create, model=model, max_tokens=1600,
-                                           system=SYSTEM_PROMPT, tools=TOOLS, messages=messages)
+                                           system=SYSTEM_PROMPT, tools=ANTHROPIC_TOOLS, messages=messages)
         except Exception as e:
             log.exception("agent LLM call failed: %s", e)
             return f"Agent LLM error: {e}", trace
@@ -131,3 +195,29 @@ async def run_agent(user_id, user_message, max_iterations=8):
             tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(result)[:6000]})
         messages.append({"role": "user", "content": tool_results})
     return "Agent hit max iterations without a final verdict.", trace
+
+
+async def run_agent(user_id, user_message, max_iterations=8):
+    provider = _resolve_provider()
+    model = settings.LLM_MODEL
+    if provider == "groq":
+        if not settings.GROQ_API_KEY:
+            return "Agent unavailable: GROQ_API_KEY not set.", []
+        return await _run_openai_compat(user_id, user_message, max_iterations,
+                                        "https://api.groq.com/openai/v1",
+                                        settings.GROQ_API_KEY,
+                                        model or "llama-3.3-70b-versatile")
+    if provider == "openai":
+        if not settings.OPENAI_API_KEY:
+            return "Agent unavailable: OPENAI_API_KEY not set.", []
+        return await _run_openai_compat(user_id, user_message, max_iterations,
+                                        settings.OPENAI_BASE_URL or None,
+                                        settings.OPENAI_API_KEY,
+                                        model or "gpt-4o-mini")
+    if provider == "anthropic":
+        if not settings.ANTHROPIC_API_KEY:
+            return "Agent unavailable: ANTHROPIC_API_KEY not set.", []
+        return await _run_anthropic(user_id, user_message, max_iterations,
+                                    settings.ANTHROPIC_API_KEY,
+                                    model or "claude-3-5-sonnet-latest")
+    return f"Agent unavailable: unknown LLM_PROVIDER '{provider}'.", []
